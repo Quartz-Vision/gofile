@@ -57,13 +57,11 @@ root:
 	}
 }
 
-func InitFileManager() (err error) {
+func init() {
 	slotsPerWorker := MAX_OPENED_FILES / WAKING_WORKERS_NUMBER
 	for i := 0; i < WAKING_WORKERS_NUMBER; i++ {
 		go startWakingManager(openedFiles[i*slotsPerWorker : (i+1)*slotsPerWorker])
 	}
-
-	return nil
 }
 
 // Creates a managed file.
