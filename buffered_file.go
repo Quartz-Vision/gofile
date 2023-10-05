@@ -31,6 +31,22 @@ func NewBufferedFile(file File, bufferSize int64) (b *BufferedFile, err error) {
 	return b, nil
 }
 
+// Seek changes current read/write position of the file.
+// The offset value is relative to the whence position which is file start, current pos or end (0, 1 or 2 respectively)
+func (b *BufferedFile) Seek(offset int64, whence int) (ret int64, err error) {
+	return b.file.Seek(offset, whence)
+}
+
+// Size returns current size of the file.
+func (b *BufferedFile) Size() (length int64, err error) {
+	return b.file.Size()
+}
+
+// Returns the seek position of the file
+func (b *BufferedFile) Position() (pos int64) {
+	return b.file.Position()
+}
+
 // Trunc truncates given file and sets it's size to 0.
 func (b *BufferedFile) Trunc() (err error) {
 	err = b.file.Trunc()
@@ -85,12 +101,6 @@ func (b *BufferedFile) Read(data []byte) (nRead int64, err error) {
 	return length, err
 }
 
-// Seek changes current read/write position of the file.
-// The offset value is relative to the whence position which is file start, current pos or end (0, 1 or 2 respectively)
-func (b *BufferedFile) Seek(offset int64, whence int) (ret int64, err error) {
-	return b.file.Seek(offset, whence)
-}
-
 // Write writes the data to a file at the seek position.
 //
 // It returns the number of bytes written and the error if there is one.
@@ -131,11 +141,6 @@ func (b *BufferedFile) Append(data []byte) (pos int64, err error) {
 	}
 
 	return pos, err
-}
-
-// Size returns current size of the file.
-func (b *BufferedFile) Size() (length int64, err error) {
-	return b.file.Size()
 }
 
 // TRead executes given function m locking the file for writing.
