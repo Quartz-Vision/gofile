@@ -1,6 +1,6 @@
 // Package gofile provides wrappers to manage big numbers of files seamlessly.
 //
-// It takes care of managing open and closed files, holding their seek positions, flags etc.
+// It takes care of managing opened and closed files, holding their seek positions, flags etc.
 // So you can use ManagedFile as any other file and "open" as many such files as you want.
 // Also it provides the transaction API, so you can safely make subsequential calls to the same file across threads.
 package gofile
@@ -15,12 +15,14 @@ import (
 )
 
 const (
-	MAX_OPEN_FILES        = 32 // mandatory: MAX_OPENED_FILES % WAKING_WORKERS_NUMBER = 0
-	WAKING_WORKERS_NUMBER = 4
+	// How many file handles the system can hold simultaneously (applies if GetFilesLimit doesn't work)
+	// mandatory: MAX_OPENED_FILES % 4 = 0
+	DEFAULT_OPENED_FILES_LIMIT = 32
+
+	MAX_OPENED_FILES_LIMIT = 1024
 )
 
-// A file that persists its state between closes.
-// Allows to open more files than available in the system for a process
+// A ManagedFile wraps a native go file, allowing it to be managed e.g. hold its size, position, state etc.
 type ManagedFile struct {
 	Path          string
 	flag          int
@@ -35,8 +37,8 @@ type ManagedFile struct {
 }
 
 var (
-	openedFiles         = [MAX_OPEN_FILES]*ManagedFile{}
-	globalWakingChannel = make(chan *ManagedFile, MAX_OPEN_FILES)
+	openedFiles         []*ManagedFile
+	globalWakingChannel = make(chan *ManagedFile, 8)
 )
 
 // manages some set of file slots for opened files and tries to wake up suspended files if possible
@@ -45,7 +47,7 @@ func startWakingManager(fileSlots []*ManagedFile) {
 root:
 	for f := range globalWakingChannel {
 		for i, tfile := range fileSlots {
-			if tfile == nil {
+			if tfile == nil || !tfile.opened {
 				fileSlots[i] = f
 				f.wakingChannel <- true
 				continue root
@@ -63,8 +65,26 @@ root:
 }
 
 func init() {
-	slotsPerWorker := MAX_OPEN_FILES / WAKING_WORKERS_NUMBER
-	for i := 0; i < WAKING_WORKERS_NUMBER; i++ {
+	openedLimit, err := GetFilesLimit()
+	if err != nil {
+		openedLimit = DEFAULT_OPENED_FILES_LIMIT
+	} else if openedLimit > 4 {
+		openedLimit = max(MAX_OPENED_FILES_LIMIT, openedLimit)
+		openedLimit -= openedLimit % 4 // make it odd with WAKING_WORKERS_NUMBER
+	}
+
+	var workersNum uint64
+	if openedLimit < 4 {
+		workersNum = 1
+	} else if openedLimit < 32 {
+		workersNum = 2
+	} else {
+		workersNum = 16
+	}
+
+	slotsPerWorker := openedLimit / workersNum
+	openedFiles = make([]*ManagedFile, openedLimit)
+	for i := uint64(0); i < workersNum; i++ {
 		go startWakingManager(openedFiles[i*slotsPerWorker : (i+1)*slotsPerWorker])
 	}
 }
@@ -136,7 +156,7 @@ func (f *ManagedFile) wake() (err error) {
 	return err
 }
 
-// Trunc truncates given file and it's size to 0
+// Trunc truncates given file and sets it's size to 0
 func (f *ManagedFile) Trunc() (err error) {
 	f.rwmutex.Lock()
 	if f.opened {
@@ -178,6 +198,26 @@ func (f *ManagedFile) ReadAt(b []byte, offset int64) (nRead int64, err error) {
 	return int64(n), err
 }
 
+// Read reads bytes from a file at the seek position.
+//
+// It returns the number of bytes read and the error if there is one.
+func (f *ManagedFile) Read(b []byte) (nRead int64, err error) {
+	f.rwmutex.RLock()
+
+	if !f.opened { // don't do the expensive call with mutex
+		if err = f.wake(); err != nil {
+			f.rwmutex.RUnlock()
+			return 0, err
+		}
+	}
+
+	n, err := f.file.Read(b)
+	f.pos += int64(n)
+
+	f.rwmutex.RUnlock()
+	return int64(n), err
+}
+
 // Seek changes current read/write position of the file.
 // The offset value is relative to the whence position which is file start, current pos or end (0, 1 or 2 respectively)
 func (f *ManagedFile) Seek(offset int64, whence int) (ret int64, err error) {
@@ -203,7 +243,20 @@ func (f *ManagedFile) Seek(offset int64, whence int) (ret int64, err error) {
 	return pos, err
 }
 
-// Write writes the data to a file at seek position.
+// Size returns current size of the file.
+func (f *ManagedFile) Size() (length int64, err error) {
+	if f.size == -1 {
+		err = f.wake()
+	}
+	return f.size, err
+}
+
+// Returns the seek position of the file
+func (f *ManagedFile) Position() (pos int64) {
+	return f.pos
+}
+
+// Write writes the data to a file at the seek position.
 //
 // It returns the number of bytes written and the error if there is one.
 func (f *ManagedFile) Write(b []byte) (nWritten int64, err error) {
@@ -217,9 +270,9 @@ func (f *ManagedFile) Write(b []byte) (nWritten int64, err error) {
 	}
 
 	n, err := f.file.Write(b)
-	newSize := f.pos + int64(n)
-	if newSize > f.size {
-		f.size = newSize
+	f.pos += int64(n)
+	if f.pos > f.size {
+		f.size = f.pos
 	}
 	f.rwmutex.Unlock()
 	return int64(n), err
@@ -263,14 +316,6 @@ func (f *ManagedFile) Append(data []byte) (pos int64, err error) {
 	return f.size - int64(len(data)), err
 }
 
-// Size returns current size of the file.
-func (f *ManagedFile) Size() (length int64, err error) {
-	if f.size == -1 {
-		err = f.wake()
-	}
-	return f.size, err
-}
-
 // TRead executes given function m locking the file for writing.
 // You can only read from this transaction.
 //
@@ -282,7 +327,10 @@ func (f *ManagedFile) TRead(m func(txn Readable) (err error)) (err error) {
 			return err
 		}
 	}
-	err = m(&ManagedFileReadableTxn{file: f})
+	err = m(&ManagedFileReadableTxn{
+		CommonTxn{file: f},
+		managedFileReadableTxn{file: f},
+	})
 	f.rwmutex.RUnlock()
 
 	return err
@@ -299,7 +347,10 @@ func (f *ManagedFile) TWrite(m func(txn Writable) (err error)) (err error) {
 			return err
 		}
 	}
-	err = m(&ManagedFileWritableTxn{file: f})
+	err = m(&ManagedFileWritableTxn{
+		CommonTxn{file: f},
+		managedFileWritableTxn{file: f},
+	})
 	f.rwmutex.Unlock()
 
 	return err
@@ -316,16 +367,17 @@ func (f *ManagedFile) TReadWrite(m func(txn Editable) (err error)) (err error) {
 		}
 	}
 	err = m(&ManagedFileRWTxn{
-		ManagedFileWritableTxn{file: f},
-		ManagedFileReadableTxn{file: f},
+		CommonTxn{file: f},
+		managedFileWritableTxn{file: f},
+		managedFileReadableTxn{file: f},
 	})
 	f.rwmutex.Unlock()
 
 	return err
 }
 
-// PipeTo allows to pipe (copy) the data from start of the file and append it to another (dest) by chunks of size chunkSize.
-func (f *ManagedFile) PipeTo(dest File, chunkSize int64) (err error) {
+// PipeTo pipes (copies) the data from start of the file and append it to another (dest) by chunks of size chunkSize.
+func (f *ManagedFile) PipeTo(dest Pipeable, chunkSize int64) (err error) {
 	if dest == f {
 		return f.TReadWrite(func(txn Editable) (err error) {
 			size, _ := txn.Size()
@@ -363,9 +415,14 @@ func (f *ManagedFile) PipeTo(dest File, chunkSize int64) (err error) {
 // Close closes the file (you can reopen it later)
 func (f *ManagedFile) Close() {
 	f.rwmutex.Lock()
+	f.wakingMutex.Lock()
+
 	if f.opened {
 		f.file.Close()
 		f.opened = false
+		f.file = nil
 	}
+
+	f.wakingMutex.Unlock()
 	f.rwmutex.Unlock()
 }
