@@ -17,6 +17,7 @@ type BufferedFile struct {
 	currentPosition int64
 	buf             []byte
 	BufferSize      int64
+	BufferDataSize  int64
 }
 
 // NewBufferedFile wraps existing File with BufferedFile and sets given bufferSize to it.
@@ -26,6 +27,7 @@ func NewBufferedFile(file File, bufferSize int64) (b *BufferedFile, err error) {
 		currentPosition: POS_REWIND,
 		buf:             make([]byte, bufferSize),
 		BufferSize:      bufferSize,
+		BufferDataSize:  0,
 	}
 
 	return b, nil
@@ -61,20 +63,51 @@ func (b *BufferedFile) Trunc() (err error) {
 func (b *BufferedFile) ReadAt(data []byte, offset int64) (nRead int64, err error) {
 	relativePos := offset - b.currentPosition
 	length := int64(len(data))
+	readEnd := relativePos + length
+	var totalCopied int64 = 0
 
-	if b.currentPosition != POS_REWIND && relativePos >= 0 && (relativePos+length) <= b.BufferSize {
-		copy(data, b.buf[relativePos:])
-		return length, nil
+	if b.currentPosition != POS_REWIND {
+		if relativePos >= 0 {
+			if readEnd <= b.BufferDataSize {
+				return int64(copy(data, b.buf[relativePos:b.BufferDataSize])), nil
+			}
+			nCopied := int64(copy(data, b.buf[relativePos:b.BufferDataSize]))
+			data = data[nCopied:]
+			offset += nCopied
+			length -= nCopied
+			totalCopied += nCopied
+		} else {
+			if readEnd <= b.BufferDataSize && readEnd > 0 {
+				nCopied := int64(copy(data[-relativePos:], b.buf[:b.BufferDataSize]))
+				length -= nCopied
+				data = data[:length]
+				totalCopied += nCopied
+			}
+		}
 	}
 
-	_, err = b.file.ReadAt(b.buf, offset)
-	if err == io.EOF {
-		err = nil
-	}
-	b.currentPosition = offset
+	if length <= b.BufferSize {
+		nRead, err = b.file.ReadAt(b.buf, offset)
+		if err == io.EOF {
+			err = nil
+		}
+		b.BufferDataSize = nRead
+		b.currentPosition = offset
 
-	copy(data, b.buf)
-	return length, err
+		totalCopied += int64(copy(data, b.buf))
+	} else {
+		nRead, err = b.file.ReadAt(data, offset)
+		if err == io.EOF {
+			err = nil
+		}
+		totalCopied += nRead
+		b.BufferDataSize = min(nRead, b.BufferSize)
+		bufOffset := nRead - b.BufferDataSize
+		b.currentPosition = offset + bufOffset
+		copy(b.buf, data[bufOffset:])
+	}
+
+	return totalCopied, err
 }
 
 // Read reads bytes from a file at the seek position.
@@ -82,23 +115,10 @@ func (b *BufferedFile) ReadAt(data []byte, offset int64) (nRead int64, err error
 // It returns the number of bytes read and the error if there is one.
 func (b *BufferedFile) Read(data []byte) (nRead int64, err error) {
 	offset := b.file.Position()
-	relativePos := offset - b.currentPosition
-	length := int64(len(data))
+	nRead, err = b.ReadAt(data, offset)
+	b.file.Seek(offset+nRead, io.SeekStart)
 
-	if b.currentPosition != POS_REWIND && relativePos >= 0 && (relativePos+length) <= b.BufferSize {
-		copy(data, b.buf[relativePos:])
-		b.file.Seek(offset+length, io.SeekStart)
-		return length, nil
-	}
-
-	_, err = b.file.Read(b.buf)
-	if err == io.EOF {
-		err = nil
-	}
-	b.currentPosition = offset
-
-	copy(data, b.buf)
-	return length, err
+	return nRead, err
 }
 
 // Write writes the data to a file at the seek position.
