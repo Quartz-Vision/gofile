@@ -42,7 +42,22 @@ func TestBasicFileCRU(t *testing.T) {
 	if err != nil && err != io.EOF {
 		t.Errorf("File: Read: %s", err.Error())
 		return
-	} else if !goslice.Equal(readContents, testContents) {
+	}
+	if !goslice.Equal(readContents, testContents) {
+		t.Errorf("File: Read: read contents != test contents")
+		return
+	}
+
+	t.Log("Testing ReadAt after Append")
+
+	readContents = make([]byte, len(testContents))
+	file.Append(testContents)
+	_, err = file.ReadAt(readContents, int64(len(testContents)))
+	if err != nil && err != io.EOF {
+		t.Errorf("File: Read: %s", err.Error())
+		return
+	}
+	if !goslice.Equal(readContents, testContents) {
 		t.Errorf("File: Read: read contents != test contents")
 		return
 	}

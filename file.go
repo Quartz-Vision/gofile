@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
-	"path"
 	"sync"
 )
 
@@ -93,8 +92,6 @@ func init() {
 //
 // Custom flags are unavailable here since the nature of the manager requires the access methods to be as uniform as possible.
 func NewFile(filePath string, perm fs.FileMode) (file *ManagedFile, err error) {
-	err = os.MkdirAll(path.Dir(filePath), os.ModePerm)
-
 	f := &ManagedFile{
 		Path:          filePath,
 		flag:          os.O_RDWR | os.O_CREATE,
@@ -157,6 +154,7 @@ func (f *ManagedFile) wake() (err error) {
 }
 
 // Trunc truncates given file and sets it's size to 0
+// [Thread safe]
 func (f *ManagedFile) Trunc() (err error) {
 	f.rwmutex.Lock()
 	if f.opened {
@@ -178,6 +176,7 @@ func (f *ManagedFile) Trunc() (err error) {
 // The offset value can be negative to specify offset from the end of the file.
 //
 // I.e. offset = -2 will mean "read the last byte of the file".
+// [Thread safe]
 func (f *ManagedFile) ReadAt(b []byte, offset int64) (nRead int64, err error) {
 	f.rwmutex.RLock()
 
@@ -201,6 +200,7 @@ func (f *ManagedFile) ReadAt(b []byte, offset int64) (nRead int64, err error) {
 // Read reads bytes from a file at the seek position.
 //
 // It returns the number of bytes read and the error if there is one.
+// [Thread safe]
 func (f *ManagedFile) Read(b []byte) (nRead int64, err error) {
 	f.rwmutex.RLock()
 
@@ -220,6 +220,7 @@ func (f *ManagedFile) Read(b []byte) (nRead int64, err error) {
 
 // Seek changes current read/write position of the file.
 // The offset value is relative to the whence position which is file start, current pos or end (0, 1 or 2 respectively)
+// [Thread safe]
 func (f *ManagedFile) Seek(offset int64, whence int) (ret int64, err error) {
 	f.rwmutex.Lock()
 
@@ -244,6 +245,7 @@ func (f *ManagedFile) Seek(offset int64, whence int) (ret int64, err error) {
 }
 
 // Size returns current size of the file.
+// [Thread safe]
 func (f *ManagedFile) Size() (length int64, err error) {
 	if f.size == -1 {
 		err = f.wake()
@@ -252,6 +254,7 @@ func (f *ManagedFile) Size() (length int64, err error) {
 }
 
 // Returns the seek position of the file
+// [Thread safe]
 func (f *ManagedFile) Position() (pos int64) {
 	return f.pos
 }
@@ -259,6 +262,7 @@ func (f *ManagedFile) Position() (pos int64) {
 // Write writes the data to a file at the seek position.
 //
 // It returns the number of bytes written and the error if there is one.
+// [Thread safe]
 func (f *ManagedFile) Write(b []byte) (nWritten int64, err error) {
 	f.rwmutex.Lock()
 
@@ -282,6 +286,7 @@ func (f *ManagedFile) Write(b []byte) (nWritten int64, err error) {
 // The offset value can be negative to specify offset from the end of the file.
 //
 // I.e. offset = -2 will mean "write the last byte of the file".
+// [Thread safe]
 func (f *ManagedFile) WriteAt(b []byte, offset int64) (nWritten int64, err error) {
 	f.rwmutex.Lock()
 
@@ -311,15 +316,32 @@ func (f *ManagedFile) WriteAt(b []byte, offset int64) (nWritten int64, err error
 }
 
 // Append appends given data at the end of the file
+//
+// It returns the position at which the data is written
+// [Thread safe]
 func (f *ManagedFile) Append(data []byte) (pos int64, err error) {
-	_, err = f.WriteAt(data, f.size)
-	return f.size - int64(len(data)), err
+	f.rwmutex.Lock()
+
+	if !f.opened {
+		if err = f.wake(); err != nil {
+			f.rwmutex.Unlock()
+			return 0, err
+		}
+	}
+
+	pos = f.size
+	n, err := f.file.WriteAt(data, pos)
+	f.size += int64(n)
+
+	f.rwmutex.Unlock()
+	return pos, err
 }
 
 // TRead executes given function m locking the file for writing.
 // You can only read from this transaction.
 //
 // Also the transaction's txn methods are faster than ManagedFile methods
+// [Thread safe]
 func (f *ManagedFile) TRead(m func(txn Readable) (err error)) (err error) {
 	f.rwmutex.RLock()
 	if !f.opened {
@@ -340,6 +362,7 @@ func (f *ManagedFile) TRead(m func(txn Readable) (err error)) (err error) {
 // You can only write from this transaction.
 //
 // Also the transaction's txn methods are faster than ManagedFile methods
+// [Thread safe]
 func (f *ManagedFile) TWrite(m func(txn Writable) (err error)) (err error) {
 	f.rwmutex.Lock()
 	if !f.opened {
@@ -359,6 +382,7 @@ func (f *ManagedFile) TWrite(m func(txn Writable) (err error)) (err error) {
 // TReadWrite executes given function m locking the file for writing/reading from other places.
 //
 // Also the transaction's txn methods are faster than ManagedFile methods
+// [Thread safe]
 func (f *ManagedFile) TReadWrite(m func(txn Editable) (err error)) (err error) {
 	f.rwmutex.Lock()
 	if !f.opened {
@@ -377,6 +401,7 @@ func (f *ManagedFile) TReadWrite(m func(txn Editable) (err error)) (err error) {
 }
 
 // PipeTo pipes (copies) the data from start of the file and append it to another (dest) by chunks of size chunkSize.
+// [Thread safe]
 func (f *ManagedFile) PipeTo(dest Pipeable, chunkSize int64) (err error) {
 	if dest == f {
 		return f.TReadWrite(func(txn Editable) (err error) {
@@ -412,7 +437,8 @@ func (f *ManagedFile) PipeTo(dest Pipeable, chunkSize int64) (err error) {
 	})
 }
 
-// Close closes the file (you can reopen it later)
+// Close closes the file.
+// [Thread safe]
 func (f *ManagedFile) Close() {
 	f.rwmutex.Lock()
 	f.wakingMutex.Lock()
