@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
+	"runtime"
 	"sync"
 )
 
@@ -18,7 +19,9 @@ const (
 	// mandatory: MAX_OPENED_FILES % 4 = 0
 	DEFAULT_OPENED_FILES_LIMIT = 32
 
-	MAX_OPENED_FILES_LIMIT = 1024
+	// Deduced from tests falling on "failed to create new OS thread" error
+	// when there are more than 4096 opened files on 8-threaded machine
+	APPROX_MAX_GOROUTINES_PER_THREAD = 512
 )
 
 // A ManagedFile wraps a native go file, allowing it to be managed e.g. hold its size, position, state etc.
@@ -48,6 +51,7 @@ root:
 		for i, tfile := range fileSlots {
 			if tfile == nil || !tfile.opened {
 				fileSlots[i] = f
+				f.opened = true
 				f.wakingChannel <- true
 				continue root
 			}
@@ -55,6 +59,7 @@ root:
 		for _, i := range rand.Perm(slotsLen) {
 			if fileSlots[i].trySuspend() {
 				fileSlots[i] = f
+				f.opened = true
 				f.wakingChannel <- true
 				continue root
 			}
@@ -64,12 +69,14 @@ root:
 }
 
 func init() {
+	openedLimitMax := runtime.GOMAXPROCS(0) * APPROX_MAX_GOROUTINES_PER_THREAD / 2
 	openedLimit, err := GetFilesLimit()
+
 	if err != nil {
 		openedLimit = DEFAULT_OPENED_FILES_LIMIT
 	} else if openedLimit > 4 {
-		openedLimit = max(MAX_OPENED_FILES_LIMIT, openedLimit)
-		openedLimit -= openedLimit % 4 // make it odd with WAKING_WORKERS_NUMBER
+		openedLimit = min(uint64(openedLimitMax), openedLimit)
+		openedLimit -= openedLimit % 4 // make it odd to avoid problems with the waking manager
 	}
 
 	var workersNum uint64
@@ -78,11 +85,12 @@ func init() {
 	} else if openedLimit < 32 {
 		workersNum = 2
 	} else {
-		workersNum = 16
+		workersNum = 4 // 4 is optimal to avoid too many context switches
 	}
 
 	slotsPerWorker := openedLimit / workersNum
 	openedFiles = make([]*ManagedFile, openedLimit)
+
 	for i := uint64(0); i < workersNum; i++ {
 		go startWakingManager(openedFiles[i*slotsPerWorker : (i+1)*slotsPerWorker])
 	}
@@ -113,11 +121,10 @@ func (f *ManagedFile) trySuspend() bool {
 	if !f.rwmutex.TryLock() {
 		return false
 	}
-
 	if f.opened {
 		f.file.Close()
+		f.opened = false
 	}
-	f.opened = false
 	f.rwmutex.Unlock()
 	return true
 }
@@ -134,7 +141,7 @@ func (f *ManagedFile) wake() (err error) {
 
 	for !f.opened { // wait for a free file slot
 		globalWakingChannel <- f
-		f.opened = <-f.wakingChannel
+		<-f.wakingChannel
 	}
 
 	f.file, err = os.OpenFile(f.Path, f.flag, f.perm)
