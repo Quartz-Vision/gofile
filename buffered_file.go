@@ -66,7 +66,7 @@ func (b *BufferedFile) ReadAt(data []byte, offset int64) (nRead int64, err error
 	readEnd := relativePos + length
 	var totalCopied int64 = 0
 
-	if b.currentPosition != POS_REWIND {
+	if b.currentPosition != POS_REWIND && relativePos < b.BufferDataSize {
 		if relativePos >= 0 {
 			if readEnd <= b.BufferDataSize {
 				return int64(copy(data, b.buf[relativePos:b.BufferDataSize])), nil
@@ -88,9 +88,6 @@ func (b *BufferedFile) ReadAt(data []byte, offset int64) (nRead int64, err error
 
 	if length <= b.BufferSize {
 		nRead, err = b.file.ReadAt(b.buf, offset)
-		if err == io.EOF {
-			err = nil
-		}
 		b.BufferDataSize = nRead
 		b.currentPosition = offset
 
