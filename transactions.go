@@ -77,7 +77,7 @@ type managedFileReadableTxn struct {
 // The offset value can be negative to specify offset from the end of the file.
 //
 // I.e. offset = -2 will mean "read the last byte of the file".
-func (t *managedFileWritableTxn) ReadAt(b []byte, offset int64) (nRead int64, err error) {
+func (t *managedFileReadableTxn) ReadAt(b []byte, offset int64) (nRead int64, err error) {
 	if offset < 0 {
 		offset += t.file.size + 1
 	}
@@ -89,7 +89,7 @@ func (t *managedFileWritableTxn) ReadAt(b []byte, offset int64) (nRead int64, er
 // Read reads bytes from a file at the seek position.
 //
 // It returns the number of bytes read and the error if there is one.
-func (t *managedFileWritableTxn) Read(b []byte) (nRead int64, err error) {
+func (t *managedFileReadableTxn) Read(b []byte) (nRead int64, err error) {
 	n, err := t.file.file.Read(b)
 	t.file.pos += int64(n)
 	return int64(n), err
